@@ -1,0 +1,498 @@
+import os
+import argparse
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from statsmodels.nonparametric.smoothers_lowess import lowess
+from scipy import stats
+import matplotlib as mpl
+
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['Arial', 'Liberation Sans', 'Bitstream Vera Sans', 'sans-serif']
+plt.rcParams['font.sans-serif'] = ['Arial'] 
+plt.rcParams['mathtext.fontset'] = 'custom'
+plt.rcParams['mathtext.rm'] = 'Arial'
+plt.rcParams['mathtext.it'] = 'Arial:italic'
+plt.rcParams['mathtext.bf'] = 'Arial:bold'
+plt.rcParams['pdf.fonttype'] = 42   # PDF 兼容性
+plt.rcParams['svg.fonttype'] = 'none'
+plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
+mpl.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["DejaVu Sans"],  
+    "font.size": 12,         
+
+    "axes.titlesize": 14,
+    "axes.labelsize": 13,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 11,
+
+    "lines.linewidth": 2,
+    "lines.markersize": 6,
+
+    "figure.titlesize": 15,
+    "figure.dpi": 300,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+
+    "axes.grid": False
+})
+
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
+
+def main():
+    ap = argparse.ArgumentParser("Step 3: Cluster Protein Trajectories")
+    ap.add_argument("--curves_csv", default="/home/yanhao/ukbml/Method/Temporal_Trend/" \
+                    "Results/s2_RA_bonf/model2_1t2.csv")
+    ap.add_argument("--out_dir", default="/home/yanhao/ukbml/Method/Temporal_Trend/" \
+                    "Results/s3_weighted_bonf/model2_1t2")
+    ap.add_argument("--n_clusters", type=int, default=2, help="Number of clusters (k)")
+    ap.add_argument("--group_to_cluster", default="RA", help="RA or Normal")
+    
+    ap.add_argument("--focus_start_year", type=int, default=-13,  ### 权重分界
+                    help="From which year to start full weighting")
+    ap.add_argument("--early_weight", type=float, default=0.1,  ### 早期权重
+                    help="Weight for years before focus_start_year (0.0 to 1.0)")
+    
+    args = ap.parse_args()
+    ensure_dir(args.out_dir)
+
+    # 1. 读取数据
+    print(f"[INFO] Loading {args.curves_csv}...")
+    df = pd.read_csv(args.curves_csv)
+    
+    # 2. 数据透视 (Pivot)
+    target_df = df[df["group"] == args.group_to_cluster].copy()
+    if target_df.empty:
+        print(f"[ERROR] No data found for group '{args.group_to_cluster}'. Check your group name.")
+        return
+    # 去除-15年的数据
+    target_df = target_df[(target_df["x"] >= -14) & (target_df["x"] <= 0)]
+    # Matrix: Index=protein, Columns=x (time), Values=y
+    matrix = target_df.pivot(index="protein", columns="x", values="y")
+    
+    # 填补缺失值 (前后填补)
+    # matrix = matrix.fillna(method='ffill', axis=1).fillna(method='bfill', axis=1)       
+    matrix = matrix.ffill(axis=1).bfill(axis=1)
+
+    # 确保时间列是排好序的 (-15, -14, ..., 0)
+    time_cols = sorted(matrix.columns)
+    matrix = matrix[time_cols]
+    
+    # 3. 核心修改：构建权重并应用
+    print(f"[INFO] Applying weights: Years >= {args.focus_start_year} get weight 1.0, others get {args.early_weight}")
+    
+    # 创建一个和时间列长度一样的权重向量
+    if args.focus_start_year != 0 :
+        weights = []
+        for t in time_cols:
+            if t < args.focus_start_year:
+                weights.append(args.early_weight) # 早期：低权重 (例如 0.1)
+            else:
+                weights.append(1.0)               # 后期：全权重
+        weights = np.array(weights)
+        # 格式示例: Year: -15(0.1) -14(0.1) ... -12(1.0) ...
+        weight_debug = " | ".join([f"{t}({w})" for t, w in zip(time_cols, weights)])
+        print(f"Weight Vector: {weight_debug}")
+        # 生成一个专门用于聚类的 weighted_matrix
+        # K-Means 计算距离是 (x1-x2)^2，乘以权重相当于拉伸坐标轴
+        matrix_for_clustering = matrix.values * weights
+    else:
+        print(f"No weighting applied")
+        matrix_for_clustering = matrix.values
+
+    # 4. K-Means 聚类 (使用加权后的数据)
+    print(f"[INFO] Clustering into {args.n_clusters} clusters...")
+    kmeans = KMeans(n_clusters=args.n_clusters, random_state=42, n_init=10)
+    
+    # 注意：这里 fit 的是 matrix_for_clustering
+    labels = kmeans.fit_predict(matrix_for_clustering)
+    
+    # 5. 保存结果 (把 Label 加回原始数据)
+    # 注意：保存和画图时，我们要用原始的 matrix (真实的 Z-score)，而不是加权后的
+    matrix["Cluster"] = labels
+    
+    cluster_res = matrix[["Cluster"]].reset_index().sort_values("Cluster")
+    res_path = os.path.join(args.out_dir, "protein_clusters_weighted.csv")
+    cluster_res.to_csv(res_path, index=False)
+    print(f"[DONE] Assignments saved to {res_path}")
+
+    # 6. 可视化 1: 热图 (Heatmap) - 画的是原始数据
+    # matrix_sorted = matrix.sort_values("Cluster")
+    # plot_data = matrix_sorted.drop(columns=["Cluster"])
+    # 根据末尾z-score排序蛋白
+    order = (
+        matrix
+        .assign(late_mean=matrix[time_cols[-3:]].mean(axis=1))
+        .sort_values(["Cluster", "late_mean"], ascending=[True, False])
+        .index
+    )
+    ori_plot_data = matrix.loc[order].drop(columns="Cluster")
+    heatmap_csv_path = os.path.join(args.out_dir, "heatmap_oridata_02.csv")
+    ori_plot_data.to_csv(heatmap_csv_path, float_format="%.4f")
+    plot_data = ori_plot_data.copy()
+    threshold_up = 0.2  ### mask阈值
+    threshold_down = -0.2
+    rows_to_keep = (plot_data > threshold_up).any(axis=1) | (plot_data < threshold_down).any(axis=1)
+    print(f"Original proteins: {len(plot_data)}, After filtering: {rows_to_keep.sum()}")
+    plot_data = plot_data.loc[rows_to_keep]
+    mask = (plot_data >= threshold_down) & (plot_data <= threshold_up)
+
+    plt.figure(figsize=(10, 12))
+    sns.heatmap(plot_data,mask=mask, cmap="RdBu_r",center=0, vmin=-2, vmax=2, 
+                linewidths=0.5, linecolor="grey", cbar_kws={'label': 'Z-score'},
+                # robust=True,
+                yticklabels=False 
+                )
+    yticks_positions = range(0, len(plot_data), 5)  # 位置：0, 5, 10...
+    yticks_labels = [plot_data.index[i] for i in yticks_positions]  # 对应的标签
+    plt.yticks(ticks=yticks_positions, labels=yticks_labels, rotation=0)
+    
+    # 权重分界点
+    # if args.focus_start_year in time_cols:
+    #     idx = time_cols.index(args.focus_start_year)
+    #     plt.axvline(idx, color='green', linestyle='--', linewidth=1, label='Weighting Threshold')
+    #     plt.legend(loc='upper right')
+
+    plt.title(f"Protein Trend Clustering")
+    plt.xlabel("Years before diagnosis")
+    plt.ylabel("Proteins")
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.out_dir, "clustering_heatmap_05.pdf"))
+    plt.close()
+
+    # 7. 可视化 2: 聚类中心趋势图 (Centroid Plot)
+    # 重新合并数据用于画折线图
+    target_df = target_df.merge(cluster_res, on="protein")
+    cluster_n = (
+        target_df
+        .groupby("Cluster")["protein"]
+        .nunique()
+        .reset_index(name="n_protein")
+    )
+    summary = (
+        target_df
+        .groupby(["Cluster", "x"])
+        .agg(
+            mean=("y", "mean"),
+            std=("y", "std"),
+            n=("y", "count")
+        )
+        .reset_index()
+    )
+    summary = summary.merge(cluster_n, on="Cluster", how="left")
+    summary["sem"] = summary["std"] / np.sqrt(summary["n"])
+    summary["ci95"] = summary.apply(
+        lambda r: stats.t.ppf(0.975, r["n"] - 1) * r["sem"]
+        if r["n"] > 1 else 0,
+        axis=1
+    )
+    summary["ci_low"] = summary["mean"] - summary["ci95"]
+    summary["ci_high"] = summary["mean"] + summary["ci95"]
+    frac = 0.7 ### LOWESS 平滑参数
+    smooth_all = []
+    for c in summary["Cluster"].unique():
+        sub = summary[summary["Cluster"] == c].sort_values("x")
+        x = sub["x"].values
+        sub["mean_s"] = lowess(sub["mean"], x, frac=frac, return_sorted=False)
+        sub["low_s"]  = lowess(sub["ci_low"], x, frac=frac, return_sorted=False)
+        sub["high_s"] = lowess(sub["ci_high"], x, frac=frac, return_sorted=False)
+        smooth_all.append(sub)
+    smooth_df = pd.concat(smooth_all)
+    cluster_colors = {
+        0: "#C25759",
+        1: "#599CB4",
+        2: "#959713"
+        }
+    plt.figure(figsize=(12, 6))
+    for c, sub in smooth_df.groupby("Cluster"):
+        n_protein = int(sub["n_protein"].iloc[0])
+        label = f"Cluster {c+1} (n={n_protein})"
+        plt.plot(
+            sub["x"], sub["mean_s"],
+            linewidth=3,
+            label=label,
+            color=cluster_colors.get(c, "black")
+        )
+        # 置信区间阴影
+        plt.fill_between(
+            sub["x"],
+            sub["low_s"],
+            sub["high_s"],
+            alpha=0.25,
+            color=cluster_colors.get(c, "black")
+        )
+    if args.focus_start_year != 0:
+        plt.axvline(args.focus_start_year, color='green', linestyle='--', alpha=0.5, label='Weighting Threshold')
+    plt.title("Cluster Trends (Weighted)")
+    plt.xlabel("Years before diagnosis")
+    plt.ylabel("Average Z-score")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(args.out_dir, "cluster_weighted_mean.svg")
+    )
+    plt.close()
+
+    # 8. 可视化 3: 所有蛋白轨迹
+    frac = 0.8          # 平滑强度
+    alpha_individual = 0.2   # 单条曲线透明度
+    lw_individual = 0.8
+    lw_mean = 6
+    cluster_col="Cluster"
+    time_col="x"
+    value_col="y"
+    clusters = sorted(target_df[cluster_col].unique())
+    for c in clusters:
+        sub = target_df[target_df[cluster_col] == c]
+        n_protein = sub["protein"].nunique()
+        plt.figure(figsize=(10, 6))
+        # cluster_colors = {
+        #     0: "#2d88bc",
+        #     1: "#c9a90c",
+        #     }
+        # 所有曲线
+        for protein, g in sub.groupby("protein"):
+            g = g.sort_values(time_col)
+            y_smooth = lowess(
+                g[value_col],
+                g[time_col],
+                frac=frac,
+                return_sorted=False
+            )
+            plt.plot(
+                g[time_col],
+                y_smooth,
+                # color="gray",
+                color=cluster_colors.get(c, "gray"),
+                alpha=alpha_individual,
+                linewidth=lw_individual
+            )
+        # mean曲线
+        mean_df = (
+            sub
+            .groupby(time_col)[value_col]
+            .mean()
+            .reset_index()
+            .sort_values(time_col)
+        )
+        mean_smooth = lowess(
+            mean_df[value_col],
+            mean_df[time_col],
+            frac=frac,
+            return_sorted=False
+        )
+        # cluster_colors = {
+        #     0: "#C25759",
+        #     1: "#599CB4",
+        #     }
+        plt.plot(
+            mean_df[time_col],
+            mean_smooth,
+            # color="tab:red",
+            color=cluster_colors.get(c, "black"),
+            linewidth=lw_mean,
+            label=f"mean (n={n_protein})"
+        )
+        plt.axhline(y=0, color='gray', linestyle="--", linewidth=1)
+        if args.focus_start_year != 0:
+            plt.axvline(args.focus_start_year, color="green", linestyle="--", alpha=0.4)
+        plt.title(f"Cluster {c+1}")
+        plt.xlabel("Years before diagnosis")
+        plt.ylabel("Z-score")
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(args.out_dir, f"cluster_{c+1}_spaghetti_lowess.svg")
+        )
+        plt.close()
+
+    print("[Plotting] Drawing all proteins trajectory...")
+    
+    # 参数复用
+    frac = 0.8           # 平滑强度
+    alpha_individual = 0.2 # 调低一点透明度，因为蛋白多，避免太乱
+    lw_individual = 0.8
+    lw_mean = 6
+    time_col = "x"
+    value_col = "y"
+
+    plt.figure(figsize=(10, 6))
+
+    # --- 第一步：画所有蛋白的单条轨迹 (灰色背景) ---
+    # 获取所有蛋白的列表
+    all_proteins = target_df["protein"].unique()
+    n_total = len(all_proteins)
+
+    for protein, g in target_df.groupby("protein"):
+        g = g.sort_values(time_col)
+        # 对每条线做平滑 (如果蛋白非常多，为了速度可以只画原始数据，或者只平滑mean)
+        # 这里保持和你之前一致，对每条线都做 LOWESS
+        try:
+            y_smooth_ind = lowess(
+                g[value_col],
+                g[time_col],
+                frac=frac,
+                return_sorted=False
+            )
+            plt.plot(
+                g[time_col],
+                y_smooth_ind,
+                color="lightgray",  # 统一用浅灰色
+                alpha=alpha_individual,
+                linewidth=lw_individual
+            )
+        except Exception:
+            # 极少数数据点过少可能导致lowess失败，跳过
+            pass
+
+    # --- 第二步：计算并画出 全局平均线 (黑色) ---
+    # 计算所有蛋白在每个时间点的平均值
+    global_mean_df = (
+        target_df
+        .groupby(time_col)[value_col]
+        .mean()
+        .reset_index()
+        .sort_values(time_col)
+    )
+    
+    # 对平均线进行平滑
+    global_mean_smooth = lowess(
+        global_mean_df[value_col],
+        global_mean_df[time_col],
+        frac=frac,
+        return_sorted=False
+    )
+
+    # 画 Z=0 参考线
+    plt.axhline(y=0, color='gray', linestyle="--", linewidth=1)
+
+    # 画 黑色平均线
+    plt.plot(
+        global_mean_df[time_col],
+        global_mean_smooth,
+        color="black",  # <--- 黑色
+        linewidth=lw_mean,
+        label=f"Global Mean (n={n_total})"
+    )
+
+    # --- 第三步：装饰与保存 ---
+    plt.title("All Proteins Trajectory")
+    plt.xlabel("Years before diagnosis")
+    plt.ylabel("Z-score")
+    plt.legend()
+    plt.tight_layout()
+
+    # 保存文件
+    save_path = os.path.join(args.out_dir, "cluster_all_spaghetti_lowess.svg")
+    plt.savefig(save_path)
+    plt.close()
+    print(f"[DONE] Saved all proteins plot to {save_path}")
+    
+    # plt.figure(figsize=(12, 6))
+    # target_df["Cluster"] = target_df["Cluster"].replace({0: "Cluster 1", 1: "Cluster 2"})
+    # sns.lineplot(
+    #     data=target_df, 
+    #     x="x", y="y", 
+    #     hue="Cluster", 
+    #     palette="tab10",
+    #     linewidth=2.5,
+    #     estimator="mean", # 画平均线
+    #     errorbar=("ci", 95) # 画置信区间
+    # )
+    # if args.focus_start_year != 0:
+    #   plt.axvline(args.focus_start_year, color='green', linestyle='--', alpha=0.5, label='Weighting Threshold')
+    # plt.title(f"Cluster Trends (Weighted)")
+    # plt.xlabel("Years before diagnosis")
+    # plt.ylabel("Average Z-score")
+    # plt.legend()
+    # plt.savefig(os.path.join(args.out_dir, "clustering_centroids_weighted.svg"))
+    # plt.close()
+    
+    print(f"[DONE] Plots saved to {args.out_dir}")
+
+# --------- LOWESS平滑热图版本 (已修正行剔除与标签对齐逻辑) ---------
+    
+    # 1. 准备数据并进行 LOWESS 平滑
+    plot_data_smooth = ori_plot_data.copy()
+    frac_heatmap = 0.8  # 平滑系数
+    x_axis = np.array(time_cols)
+    
+    print(f"Original protein count: {len(plot_data_smooth)}")
+    
+    for protein in plot_data_smooth.index:
+        y_raw = plot_data_smooth.loc[protein].values
+        # 对每一行蛋白轨迹进行平滑
+        plot_data_smooth.loc[protein] = lowess(y_raw, x_axis, frac=frac_heatmap, return_sorted=False)
+
+    # 2. 【核心修改】直接从数据中剔除中间不感兴趣的蛋白行
+    # 这样热图中间就不会出现大面积空白，剩下的蛋白会接在一起
+    rm_num = 57
+    center_idx = 107
+    start_idx = max(0, center_idx - rm_num + 1 )
+    end_idx = min(len(plot_data_smooth), center_idx + rm_num)
+    
+    # 使用 pd.concat 拼接保留的上下两部分
+    plot_filtered = pd.concat([
+        plot_data_smooth.iloc[:start_idx-1], 
+        plot_data_smooth.iloc[end_idx:]
+    ])
+    
+    print(f"Filtered protein count: {len(plot_filtered)} (Removed {end_idx - start_idx+1} proteins)")
+
+    # 3. 构建数值掩码 (只针对过滤后剩下的数据)
+    threshold_down = -0.3
+    threshold_up = 0.3
+    # 遮盖掉在阈值范围内的平淡数据点
+    final_mask = (plot_filtered >= threshold_down) & (plot_filtered <= threshold_up)
+
+    # 进一步剔除掉整行都在阈值范围内的蛋白
+    rows_to_keep_final = ~final_mask.all(axis=1)
+    plot_filtered = plot_filtered.loc[rows_to_keep_final]
+    final_mask = final_mask.loc[rows_to_keep_final]
+
+
+    # 4. 绘图
+    # 因为行数减少了，figsize 的高度可以适当减小（比如从 12 减到 8）
+    plt.figure(figsize=(8, 16)) 
+    ax = sns.heatmap(
+        plot_filtered, 
+        mask=final_mask, 
+        cmap="RdBu_r", 
+        center=0, 
+        vmin=-2, 
+        vmax=2, 
+        linewidths=0.5,
+        linecolor="grey",
+        cbar_kws={'label': 'Smoothed Z-score'},
+        yticklabels=True  # 设为 True 以便后面自定义 labels
+    )
+
+    total_remaining = len(plot_filtered)
+    if total_remaining < 150:
+        step = 1
+    else:
+        step = 5
+        
+    yticks_pos = np.arange(0, total_remaining, step)
+    yticks_labs = [plot_filtered.index[i] for i in yticks_pos]
+    
+    plt.yticks(ticks=yticks_pos + 0.5, labels=yticks_labs, rotation=0, fontsize=8)
+
+    plt.title(f"Protein Trend Clustering (LOWESS Smoothed)\nGroup: {args.group_to_cluster} | Removed center {end_idx-start_idx} rows")
+    plt.xlabel("Years before diagnosis")
+    plt.ylabel("Proteins")
+    plt.tight_layout()
+    
+    smooth_heatmap_path = os.path.join(args.out_dir, "clustering_heatmap_LOWESS_smoothed_rm_3.pdf")
+    plt.savefig(smooth_heatmap_path)
+    plt.close()
+    print(f"[DONE] Filtered smoothed heatmap saved to {smooth_heatmap_path}")
+
+
+if __name__ == "__main__":
+    main()

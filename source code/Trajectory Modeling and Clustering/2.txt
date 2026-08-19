@@ -1,0 +1,155 @@
+import os
+import argparse
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
+
+def safe_to_numeric(s): return pd.to_numeric(s, errors="coerce")
+
+def calculate_zscore(df, proteins, ctrl_mask):
+    """
+    基于对照组(Control)的均值和标准差，对所有人的蛋白数据进行 Z-score 标准化。
+    公式: Z = (X - Mean_ctrl) / SD_ctrl
+    """
+    df_z = df.copy()
+    for p in proteins:
+        # 只用对照组的数据计算基准
+        ctrl_vals = df.loc[ctrl_mask, p]
+        mu = np.nanmean(ctrl_vals)
+        sd = np.nanstd(ctrl_vals)
+        
+        # 防止除以0
+        if sd == 0 or np.isnan(sd):
+            df_z[p] = 0
+        else:
+            df_z[p] = (df[p] - mu) / sd
+    return df_z
+
+def get_smooth_trend(df_group, protein, time_col, min_t=-15, max_t=0):
+    """
+    计算随时间变化的趋势（均值和95%置信区间）。
+    使用按年分箱(Binning)的方法。
+    """
+    # 1. 提取时间和蛋白值
+    data = df_group[[time_col, protein]].dropna()
+    t_vals = data[time_col].values
+    y_vals = data[protein].values
+
+    # 2. 准备输出容器
+    out_x = []
+    out_y = []
+    out_lo = []
+    out_hi = []
+
+    # 3. 按年循环计算 (从 min_t 到 max_t)
+    # 我们把时间四舍五入到最近的整数年
+    rounded_t = np.round(t_vals)
+    
+    for t in range(int(min_t), int(max_t) + 1):
+        # 找到落在这一年（比如 -5年）附近的所有样本
+        # 这里的窗口可以根据样本量调整，比如 t +/- 0.5 或 t +/- 1
+        mask = (rounded_t == t)
+        current_y = y_vals[mask]
+
+        if len(current_y) < 3: # 样本太少就算了
+            continue
+        
+        # 计算均值
+        mean_val = np.mean(current_y)
+        
+        # 计算标准误 (SEM) 和 95% CI
+        sem = stats.sem(current_y)
+        ci = 1.96 * sem # 95% Confidence Interval
+        
+        out_x.append(t)
+        out_y.append(mean_val)
+        out_lo.append(mean_val - ci)
+        out_hi.append(mean_val + ci)
+
+    return pd.DataFrame({
+        "protein": protein,
+        "x": out_x,
+        "y": out_y,
+        "y_lo": out_lo,
+        "y_hi": out_hi
+    })
+
+def main():
+    ap = argparse.ArgumentParser(description="Step 2: Fit curves for temporal trends")
+    ap.add_argument("--matched_csv",default="/home/yanhao/ukbml/Method/Temporal_Trend/Results/RA_0320/" \
+    "s1_2models/Model2_1to2/matched_wide_Model2_1to2.csv")
+    ap.add_argument("--out_dir",default="/home/yanhao/ukbml/Method/Temporal_Trend/Results/s2_RA_bonf")
+    ap.add_argument("--proteins",default="/home/yanhao/ukbml/Method/Temporal_Trend/RA_bonf.txt")
+    
+    # 时间列名是 follow_time，RA 标签是 later_illness_label
+    ap.add_argument("--time_col", default="follow_time")
+    ap.add_argument("--event_col", default="later_illness_label") 
+    
+    args = ap.parse_args()
+    ensure_dir(args.out_dir)
+    out_path = os.path.join(args.out_dir, "model2_1t2.csv")
+
+    print(f"[INFO] Loading data: {args.matched_csv}")
+    df = pd.read_csv(args.matched_csv)
+
+    # 1. 解析蛋白质列表
+    if os.path.isfile(args.proteins):
+        # 如果是文件路径
+        with open(args.proteins, 'r') as f:
+            prot_list = [line.strip().split()[0] for line in f if line.strip()]
+    else:
+        # 如果是逗号分隔字符串
+        prot_list = [p.strip() for p in args.proteins.split(",") if p.strip()]
+    
+    # 确保这些蛋白都在 CSV 里
+    valid_prots = [p for p in prot_list if p in df.columns]
+    print(f"[INFO] Found {len(valid_prots)} proteins to analyze.")
+
+    # 2. 处理时间轴 (关键步骤)
+    # follow_time 是正数（比如 5.3 年），我们需要把它变成“确诊前的时间” (X轴)
+    # 对于 Case (label=1): X = -1 * follow_time (确诊前 X 年)
+    # 对于 Control (label=0): X = -1 * follow_time (随访结束前 X 年，或者作为平行对照)
+    # 这里我们统一取负数
+    df["time_to_event"] = -1 * safe_to_numeric(df[args.time_col])
+
+    # 3. Z-score 标准化
+    # 必须基于 Control 组来算，这样 Control 的均值会在 0 附近
+    ctrl_mask = (df[args.event_col] == 0)
+    df_z = calculate_zscore(df, valid_prots, ctrl_mask)
+
+    # 4. 循环计算每个蛋白的曲线
+    all_curves = []
+
+    for idx, p in enumerate(valid_prots):
+        if (idx+1) % 10 == 0:
+            print(f"Processing {idx+1}/{len(valid_prots)}: {p}")
+            
+        # --- Group: RA (Case) ---
+        case_df = df_z[df_z[args.event_col] == 1]
+        res_case = get_smooth_trend(case_df, p, "time_to_event", min_t=-15, max_t=0)
+        if not res_case.empty:
+            res_case["group"] = "RA" # 对应 Step2 代码里的图例名称
+            all_curves.append(res_case)
+
+        # --- Group: Normal (Control) ---
+        ctrl_df = df_z[df_z[args.event_col] == 0]
+        res_ctrl = get_smooth_trend(ctrl_df, p, "time_to_event", min_t=-15, max_t=0)
+        if not res_ctrl.empty:
+            res_ctrl["group"] = "Normal" # 对应 Step2 代码里的图例名称
+            all_curves.append(res_ctrl)
+
+    # 5. 合并并保存
+    if not all_curves:
+        print("[ERROR] No curves generated. Check data columns or content.")
+        return
+
+    final_df = pd.concat(all_curves, ignore_index=True)
+    
+    final_df.to_csv(out_path, index=False)
+    print(f"[DONE] Curves saved to: {out_path}")
+    print("Now you can run Step 2 (replot) using this file.")
+
+if __name__ == "__main__":
+    main()

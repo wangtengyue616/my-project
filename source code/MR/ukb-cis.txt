@@ -1,0 +1,114 @@
+library(TwoSampleMR)
+library(ggplot2)
+library(foreach)
+
+setwd("G:/UKB-PPP/ukb_pqtl_MR")
+
+# ============================================================
+# 辅助函数：计算 F-statistic 并过滤弱工具变量
+# ============================================================
+calc_f_and_filter <- function(dat, f_threshold = 10) {
+  n   <- dat$samplesize.exposure
+  b   <- dat$beta.exposure
+  se  <- dat$se.exposure
+  eaf <- dat$eaf.exposure
+  
+  r2_num <- 2 * b^2 * eaf * (1 - eaf)
+  r2_den <- r2_num + 2 * n * eaf * (1 - eaf) * se^2
+  dat$R2 <- r2_num / ifelse(r2_den == 0, NA, r2_den)
+  dat$f  <- dat$R2 * (n - 2) / ifelse((1 - dat$R2) == 0, NA, (1 - dat$R2))
+  dat$meanf <- mean(dat$f, na.rm = TRUE)
+  
+  dat[!is.na(dat$f) & dat$f > f_threshold, ]
+}
+
+# ============================================================
+# 核心处理函数：单个基因的完整 MR 流程
+# ============================================================
+run_mr_for_gene <- function(gene_id, outcome_file) {
+  
+  # 1. 读取暴露数据
+  expo_file <- file.path("cis_clump", paste0(gene_id, "_expo_rt.txt"))
+  if (!file.exists(expo_file)) return(invisible(NULL))
+  
+  expo_rt <- read_exposure_data(
+    filename          = expo_file, sep = "\t",
+    snp_col           = "rsids2",      beta_col       = "BETA",
+    se_col            = "SE",          effect_allele_col = "ALLELE1",
+    other_allele_col  = "ALLELE0",     eaf_col        = "A1FREQ",
+    pval_col          = "p",           samplesize_col = "N"
+  )
+  
+  # 2. 读取结局数据
+  outc_rt <- read_outcome_data(
+    snps              = expo_rt$SNP,
+    filename          = outcome_file, sep = "\t",
+    snp_col           = "rsid",             beta_col          = "beta",
+    se_col            = "standard_error",   effect_allele_col = "effect_allele",
+    other_allele_col  = "other_allele",     eaf_col           = "effect_allele_frequency",
+    pval_col          = "p_value",          samplesize_col    = "n"
+  )
+  
+  # 3. Harmonisation + F-statistic + Steiger
+  harm_rt <- harmonise_data(expo_rt, outc_rt, action = 2)
+  harm_rt <- calc_f_and_filter(harm_rt)
+  harm_rt <- steiger_filtering(harm_rt)
+  
+  if (nrow(harm_rt) < 2) return(invisible(NULL))
+  
+  # 4. MR 分析
+  mr_result  <- mr(harm_rt)
+  result_or  <- generate_odds_ratios(mr_result)
+  
+  # 原逻辑：第3行 pval < 1（即有效结果）
+  if (is.null(result_or) || nrow(result_or) < 3 || result_or$pval[3] >= 1) {
+    return(invisible(NULL))
+  }
+  
+  # 5. 创建输出目录并保存表格结果
+  out_dir <- file.path("ukbpqtlresult", gene_id)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  write.table(harm_rt, file.path(out_dir, "harmonise.txt"),
+              row.names = FALSE, sep = "\t", quote = FALSE)
+  write.table(result_or[, 5:ncol(result_or)], file.path(out_dir, "OR.txt"),
+              row.names = FALSE, sep = "\t", quote = FALSE)
+  write.table(mr_pleiotropy_test(harm_rt), file.path(out_dir, "pleiotropy.txt"),
+              sep = "\t", quote = FALSE)
+  write.table(mr_heterogeneity(harm_rt), file.path(out_dir, "heterogeneity.txt"),
+              sep = "\t", quote = FALSE)
+  
+  singlesnp_res <- mr_singlesnp(harm_rt)
+  singlesnpOR   <- generate_odds_ratios(singlesnp_res)
+  write.table(singlesnpOR, file.path(out_dir, "singlesnpOR.txt"),
+              row.names = FALSE, sep = "\t", quote = FALSE)
+  
+  capture.output(run_mr_presso(harm_rt, NbDistribution = 1000),
+                 file = file.path(out_dir, "presso.txt"))
+  
+  # 6. 保存图片
+  ggsave(mr_scatter_plot(mr_result, harm_rt)[[1]],
+         file.path(out_dir, "scatter.pdf"), width = 8, height = 8)
+  ggsave(mr_forest_plot(singlesnp_res)[[1]],
+         file.path(out_dir, "forest.pdf"), width = 8, height = 8)
+  ggsave(mr_leaveoneout_plot(mr_leaveoneout(harm_rt))[[1]],
+         file.path(out_dir, "sensitivity-analysis.pdf"), width = 8, height = 8)
+  ggsave(mr_funnel_plot(singlesnp_res)[[1]],
+         file.path(out_dir, "funnelplot.pdf"), width = 8, height = 8)
+  
+  message(sprintf("[DONE] %s | p=%.2e", gene_id, result_or$pval[3]))
+}
+
+# ============================================================
+# 主循环
+# ============================================================
+genelist  <- read.table("ukb_cis_clump_id.txt", header = TRUE, sep = "\t")
+gene_ids  <- as.vector(genelist$id)
+outcome_f <- "myoutcome.tsv.gz"
+
+foreach(i = gene_ids, .errorhandling = "pass") %do% {
+  tryCatch(
+    run_mr_for_gene(i, outcome_f),
+    error = function(e) message(sprintf("[ERROR] %s: %s", i, e$message))
+  )
+}

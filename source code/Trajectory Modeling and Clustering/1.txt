@@ -1,0 +1,321 @@
+# src/Temporal_Trends_step1_matching.py
+# ASCII-only
+# Step1: Matching for temporal trends
+# - Match on cols 7-13 (sex, age, ethnicity, education, smoking, drinking, BMI)
+#   with ratios 1:1 and 1:2
+# - Match on cols 7-14 (add urate) with ratios 1:1 and 1:2
+# - Outcome label: col5 (Gout, 0/1)
+# - Follow-up time: col6 (years)
+# - Proteins are cols 15-24 (not used here; only kept in matched wide output)
+
+import os
+import argparse
+import numpy as np
+import pandas as pd
+from sklearn.neighbors import KDTree
+
+
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
+def safe_to_numeric(s): return pd.to_numeric(s, errors="coerce")
+
+
+def infer_urate_col(df):
+    cands = [c for c in df.columns if ("urate" in c.lower()) or ("uric" in c.lower())]
+    return cands[0] if cands else None
+
+
+def zscore_series(x):
+    x = safe_to_numeric(x)
+    mu = np.nanmean(x)
+    sd = np.nanstd(x)
+    if not np.isfinite(sd) or sd == 0:
+        return pd.Series(np.zeros(len(x)), index=x.index)
+    return (x - mu) / sd
+
+
+def build_strata_key(df, cat_cols):
+    return df[cat_cols].astype(str).agg("||".join, axis=1)
+
+
+def match_one_case(X_case, ctrl_idx, X_ctrl, k, caliper, query_k):
+    """
+    Nearest neighbors via KDTree inside stratum.
+    Choose first k with dist<=caliper. No replacement handled outside.
+    """
+    if len(ctrl_idx) < k:
+        return []
+    qk = min(query_k, len(ctrl_idx))
+    tree = KDTree(X_ctrl, metric="euclidean")
+    dist, ind = tree.query(X_case.reshape(1, -1), k=qk)
+    dist = dist.ravel(); ind = ind.ravel()
+    chosen = []
+    for d, j in zip(dist, ind):
+        if caliper is not None and d > caliper:
+            break
+        chosen.append(ctrl_idx[j])
+        if len(chosen) >= k:
+            break
+    return chosen
+
+
+def run_matching_kdtree(
+    df,
+    event_col,
+    match_cols_cat,
+    match_cols_cont,
+    k_controls=1,
+    caliper=1.0,
+    seed=42,
+    query_k=80,
+    progress_every=1000
+):
+    """
+    Exact match on categorical columns; KDTree NN on z-scored continuous columns.
+    Greedy, no replacement controls.
+    Returns matched_wide, pairs_df.
+    """
+    rng = np.random.default_rng(seed)
+    d = df.copy()
+
+    d[event_col] = safe_to_numeric(d[event_col])
+    d = d[d[event_col].isin([0, 1])].copy()
+
+    # drop NA in matching columns
+    need = match_cols_cat + match_cols_cont + [event_col]
+    d = d.dropna(subset=need).copy()
+
+    # cast categorical as str (exact match)
+    for c in match_cols_cat:
+        d[c] = d[c].astype(str)
+
+    # z-score continuous globally
+    cont_z = []
+    for c in match_cols_cont:
+        zc = c + "__z"
+        d[zc] = zscore_series(d[c])
+        cont_z.append(zc)
+
+    d["_strata"] = build_strata_key(d, match_cols_cat)
+
+    cases = d[d[event_col] == 1].copy()
+    ctrls = d[d[event_col] == 0].copy()
+
+    # controls by stratum
+    ctrl_groups = {}
+    for s, sub in ctrls.groupby("_strata"):
+        idx = sub.index.values
+        X = sub[cont_z].astype(float).values
+        ctrl_groups[s] = {"idx": idx, "X": X}
+
+    case_indices = cases.index.values.copy()
+    rng.shuffle(case_indices)
+
+    used_ctrl = set()
+    pairs = []
+    set_id = 0
+    matched_cases = 0
+
+    for t, ci in enumerate(case_indices, start=1):
+        s = cases.loc[ci, "_strata"]
+        grp = ctrl_groups.get(s, None)
+        if grp is None:
+            continue
+
+        idx_all = grp["idx"]
+        mask = np.array([i not in used_ctrl for i in idx_all], dtype=bool)
+        if mask.sum() < k_controls:
+            continue
+
+        idx_av = idx_all[mask]
+        X_av = grp["X"][mask]
+        X_case = cases.loc[ci, cont_z].astype(float).values
+
+        chosen = match_one_case(X_case, idx_av, X_av, k_controls, caliper, query_k)
+        if len(chosen) < k_controls:
+            continue
+
+        set_id += 1
+        matched_cases += 1
+        for uj in chosen:
+            pairs.append({"match_set": set_id, "case_idx": ci, "ctrl_idx": uj})
+            used_ctrl.add(uj)
+
+        if progress_every and (t % progress_every == 0):
+            print(f"[INFO] processed cases {t}/{len(case_indices)} | matched_cases={matched_cases} | sets={set_id}")
+
+    pairs = pd.DataFrame(pairs)
+    if pairs.empty:
+        raise RuntimeError("No matched sets found. Try larger caliper or query_k, or check matching columns.")
+
+    # build matched wide
+    case_ids = pairs["case_idx"].unique().tolist()
+    ctrl_ids = pairs["ctrl_idx"].unique().tolist()
+
+    m_cases = d.loc[case_ids].copy(); m_cases["is_case"] = 1
+    m_ctrls = d.loc[ctrl_ids].copy(); m_ctrls["is_case"] = 0
+
+    case_set = pairs.drop_duplicates("case_idx").set_index("case_idx")["match_set"]
+    ctrl_set = pairs.set_index("ctrl_idx")["match_set"]
+    m_cases["match_set"] = m_cases.index.map(case_set)
+    m_ctrls["match_set"] = m_ctrls.index.map(ctrl_set)
+
+    matched = pd.concat([m_cases, m_ctrls], axis=0).sort_values(["match_set", "is_case"], ascending=[True, False])
+    return matched, pairs
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    # 默认路径可以根据你的实际环境修改
+    ap.add_argument("--input_csv", 
+                    default="/DATA1/yanhao/ukbml/Dataset/Temporal_Trend/merged_RA.csv",
+                    help="Path to input CSV file")                
+    ap.add_argument("--out_dir", 
+                    default="/home/yanhao/ukbml/Method/Temporal_Trend/Results/RA_0320/s1_2models",
+                    help="Directory to save results")
+
+    ap.add_argument("--caliper", type=float, default=1.0)
+    ap.add_argument("--query_k", type=int, default=120)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--progress_every", type=int, default=500)
+
+    # 这些参数用不到了，但保留防止报错
+    ap.add_argument("--event_col", default=None)
+    ap.add_argument("--followup_col", default=None)
+    ap.add_argument("--urate_col", default=None)
+
+    args = ap.parse_args()
+    ensure_dir(args.out_dir)
+
+    df = pd.read_csv(args.input_csv)
+    print(f"[INFO] Loaded data with shape: {df.shape}")
+
+    # ================= 配置列名 =================
+    # 1. 结局与时间
+    event_col = "later_illness_label"
+    followup_col = "follow_time" # 仅用于确保格式，不参与匹配
+
+    # 2. 所有的变量池
+    # sex_col = "sex"
+    # age_col = "age"
+    # race_col = "race"
+    
+    # bmi_col = "bmi"
+    # smoke_col = "smoking"
+    # drink_col = "drinking"
+    # phy_col = "Physical_Activity_Level"
+    # edu_col = "Education"
+    # diet_col = "MedDiet_score"
+    # townsend_col = "Townsend_deprivation_index"
+    # -------------------
+    sex_col = "Sex"
+    age_col = "Age"
+    race_col = "Race"
+    # 生活方式 / SES
+    smoke_col = "Smoking"
+    drink_col = "Alcohol_Drinking"
+    edu_col = "Educational Level"
+    townsend_col = "Townsend_deprivation_index"
+    income_col = "Household_Income"
+    # 代谢指标
+    waist_col = "waist_circumference"
+    tg_col = "triglycerides"
+    bp_col = "blood_pressure"
+    glu_col = "blood_glucose"
+    hdl_col = "HDL_cholesterol"
+
+    # 确保 follow_time 是数值 (为了防止后续处理报错)
+    if followup_col in df.columns:
+        df[followup_col] = safe_to_numeric(df[followup_col])
+
+    # ================= 定义两个模型 =================
+    
+    # --- Model 1: Basic (Age + Sex + Race) ---
+    cat_m1 = [sex_col, race_col] 
+    cont_m1 = [age_col]
+    # # --- Model 2: Fully Adjusted (Model 1 + Lifestyle + SES + BMI) ---
+    # cat_m2 = [sex_col, race_col, smoke_col, drink_col, phy_col, edu_col]
+    # cont_m2 = [age_col, bmi_col, diet_col, townsend_col]
+    # -----------
+    cat_m2 = [sex_col, race_col, smoke_col, drink_col, edu_col]
+    cont_m2 = [age_col, townsend_col, income_col, waist_col, tg_col, bp_col, glu_col, hdl_col]
+
+    # 检查列是否存在，如果不存在则自动剔除并警告
+    def validate_cols(name, c_list):
+        valid = [c for c in c_list if c in df.columns]
+        missing = set(c_list) - set(valid)
+        if missing:
+            print(f"[WARNING] In {name}, missing columns: {missing}")
+        return valid
+
+    cat_m1 = validate_cols("Model 1 Cat", cat_m1)
+    cont_m1 = validate_cols("Model 1 Cont", cont_m1)
+    cat_m2 = validate_cols("Model 2 Cat", cat_m2)
+    cont_m2 = validate_cols("Model 2 Cont", cont_m2)
+
+    # ================= 设置运行变体 =================
+    # 结构: (文件夹名后缀, 分类变量列表, 连续变量列表, 匹配比例)
+    variants = [
+        # Model 1 
+        # ("Model1_1to1", cat_m1, cont_m1, 1),
+        # ("Model1_1to2", cat_m1, cont_m1, 2),
+        
+        # Model 2 
+        ("Model2_1to1",  cat_m2, cont_m2, 1),
+        ("Model2_1to2",  cat_m2, cont_m2, 2),
+        ("Model2_1to5",  cat_m2, cont_m2, 5),
+        ("Model2_1to10",  cat_m2, cont_m2, 10),
+    ]
+
+    summary_lines = []
+    summary_lines.append(f"Input: {args.input_csv}")
+    summary_lines.append(f"Event col: {event_col}")
+    summary_lines.append("")
+
+    # ================= 开始循环匹配 =================
+    # 注意：这里的循环解包增加了 cat_cols，因为每个模型的分类变量不同了
+    for tag, match_cols_cat, match_cols_cont, k_controls in variants:
+        print(f"\n[INFO] Running {tag} (Ratio 1:{k_controls}) ...")
+        print(f"       -> Cat: {match_cols_cat}")
+        print(f"       -> Cont: {match_cols_cont}")
+        
+        out_sub = os.path.join(args.out_dir, tag)
+        ensure_dir(out_sub)
+
+        try:
+            matched, pairs = run_matching_kdtree(
+                df=df,
+                event_col=event_col,
+                match_cols_cat=match_cols_cat,  # 这里传入当前模型的分类变量
+                match_cols_cont=match_cols_cont, # 这里传入当前模型的连续变量
+                k_controls=k_controls,
+                caliper=args.caliper,
+                seed=args.seed,
+                query_k=args.query_k,
+                progress_every=args.progress_every
+            )
+
+            matched_path = os.path.join(out_sub, f"matched_wide_{tag}.csv")
+            pairs_path = os.path.join(out_sub, f"matched_pairs_{tag}.csv")
+            matched.to_csv(matched_path, index=False)
+            pairs.to_csv(pairs_path, index=False)
+
+            n_sets = pairs["match_set"].nunique()
+            n_cases = pairs["case_idx"].nunique()
+            n_ctrls = pairs["ctrl_idx"].nunique()
+            msg = f"{tag}: sets={n_sets} cases={n_cases} ctrls={n_ctrls} saved={out_sub}"
+            print("[DONE]", msg)
+            summary_lines.append(msg)
+            
+        except Exception as e:
+            print(f"[ERROR] Failed {tag}: {e}")
+            summary_lines.append(f"{tag}: FAILED - {e}")
+
+    with open(os.path.join(args.out_dir, "matching_summary.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines) + "\n")
+
+    print("\n[DONE] All matching tasks finished.")
+    print("Summary saved to:", os.path.join(args.out_dir, "matching_summary.txt"))
+
+if __name__ == "__main__":
+    main()
+
